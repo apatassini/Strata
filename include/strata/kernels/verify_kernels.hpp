@@ -46,6 +46,14 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// QWEN3.8 14/10/2026: logits[t][j] += bias[j] + sum_k E[ids[t][k]][j] (n rows of 512; bias/E may be null)
+void pred_head_add(float* logits, const float* bias, const float* E, const int32_t* ids, int n, int k, void* stream);
+// QWEN3.8 15/10/2026 STRATA_PRED_THR: experts of the window over a probability, best first, -1 after (cap slots)
+void pred_thr_select(const float* logits, int n, float cal_a, float cal_b, float zthr, int32_t* out, int cap, void* stream);
+/// QWEN3.8 14/10/2026: *flag = value from the stream (mapped host word)
+void set_mapped_u32(uint32_t* flag, uint32_t value, void* stream);
+/// QWEN3.8 14/10/2026: asks the L2 for [p, p + bytes) (prefetch.global.L2::evict_last, one per 128-byte line)
+void l2_prefetch(const void* p, uint64_t bytes, void* stream);
 /// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
 /// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
 /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).

@@ -1291,6 +1291,71 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
     check("wait_copy_i32_from_mapped");
 }
 
+namespace {
+__global__ void pred_head_add_kernel(float* logits, const float* bias, const float* E, const int32_t* ids, int k) {
+    const int t = blockIdx.x, j = threadIdx.x;
+    float s = bias != nullptr ? bias[j] : 0.0f;
+    if (E != nullptr)
+        for (int q = 0; q < k; ++q) {
+            const int e = ids[t * k + q];
+            if (e >= 0 && e < 512) s += E[(size_t) e * 512 + j];
+        }
+    logits[(size_t) t * 512 + j] += s;
+}
+__global__ void set_mapped_u32_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+}  // namespace
+namespace {
+__global__ void pred_thr_select_kernel(const float* logits, int n, float ca, float cb, float zthr, int32_t* out, int cap) {
+    __shared__ float zs[512];
+    __shared__ int cs[512];
+    const int e = threadIdx.x;
+    float m = -1e30f;
+    for (int t = 0; t < n; ++t) m = fmaxf(m, logits[(size_t) t * 512 + e]);
+    float sum = 0.0f;
+    for (int t = 0; t < n; ++t) sum += __expf(logits[(size_t) t * 512 + e] - m);
+    const float z = ca * (m + __logf(sum)) + cb;
+    const int c = z >= zthr ? 1 : 0;
+    zs[e] = z; cs[e] = c;
+    const int nc = __syncthreads_count(c);
+    if (c) {
+        int r = 0;
+        for (int j = 0; j < 512; ++j) r += cs[j] && (zs[j] > z || (zs[j] == z && j < e));
+        if (r < cap) out[r] = e;
+    }
+    for (int i = nc + e; i < cap; i += 512) out[i] = -1;
+}
+}  // namespace
+void pred_thr_select(const float* logits, int n, float cal_a, float cal_b, float zthr, int32_t* out, int cap, void* stream) {
+    if (n <= 0 || cap <= 0) return;
+    pred_thr_select_kernel<<<1, 512, 0, (cudaStream_t) stream>>>(logits, n, cal_a, cal_b, zthr, out, cap);
+    check("pred_thr_select");
+}
+void pred_head_add(float* logits, const float* bias, const float* E, const int32_t* ids, int n, int k, void* stream) {
+    if (n <= 0 || (bias == nullptr && E == nullptr)) return;
+    pred_head_add_kernel<<<n, 512, 0, (cudaStream_t) stream>>>(logits, bias, E, ids, k);
+    check("pred_head_add");
+}
+namespace {
+__global__ void l2_prefetch_kernel(const char* p, unsigned long long bytes) {
+    const unsigned long long step = (unsigned long long) gridDim.x * blockDim.x * 128ull;
+    for (unsigned long long o = ((unsigned long long) blockIdx.x * blockDim.x + threadIdx.x) * 128ull; o < bytes; o += step)
+        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p + o));
+}
+}  // namespace
+void l2_prefetch(const void* p, uint64_t bytes, void* stream) {
+    if (p == nullptr || bytes == 0) return;
+    l2_prefetch_kernel<<<64, 256, 0, (cudaStream_t) stream>>>((const char*) p, (unsigned long long) bytes);
+    check("l2_prefetch");
+}
+void set_mapped_u32(uint32_t* flag, uint32_t value, void* stream) {
+    set_mapped_u32_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("set_mapped_u32");
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");

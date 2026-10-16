@@ -175,9 +175,27 @@ bool env_on(const char* name) {
 }
 #if defined(STRATA_USE_HIP)
 const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
-const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
+const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");   // QWEN3.8 PIANO_VELOCE: also on CUDA
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+// QWEN3.8 16/10/2026 STRATA_QW_PIANO_T: ring seen -> plan published, per layer (patch_tempopiano.py)
+static const bool g_qw_piano_t = env_on("STRATA_QW_PIANO_T");
+static std::chrono::steady_clock::time_point g_qw_ring, g_qw_pub;
+static double g_qw_us[2] = {0, 0}, g_qw_srv[2] = {0, 0};
+static long long g_qw_n[2] = {0, 0};
+static void qw_piano_fine(bool miss) {   // the layer is served: account it
+    const auto e = std::chrono::steady_clock::now();
+    const int m = miss ? 1 : 0;
+    g_qw_us[m] += std::chrono::duration<double, std::micro>(g_qw_pub - g_qw_ring).count();
+    g_qw_srv[m] += std::chrono::duration<double, std::micro>(e - g_qw_pub).count();
+    if (++g_qw_n[m] + g_qw_n[1 - m] >= 4800) {
+        std::fprintf(stderr, "QWEN3.8 piano: strati senza mancanti %lld, campanello->piano %.2f us, piano->fine %.2f us; "
+                     "con mancanti %lld, campanello->piano %.2f us, piano->fine %.2f us\n",
+                     g_qw_n[0], g_qw_n[0] ? g_qw_us[0] / g_qw_n[0] : 0.0, g_qw_n[0] ? g_qw_srv[0] / g_qw_n[0] : 0.0,
+                     g_qw_n[1], g_qw_n[1] ? g_qw_us[1] / g_qw_n[1] : 0.0, g_qw_n[1] ? g_qw_srv[1] / g_qw_n[1] : 0.0);
+        g_qw_us[0] = g_qw_us[1] = g_qw_srv[0] = g_qw_srv[1] = 0; g_qw_n[0] = g_qw_n[1] = 0;
+    }
+}
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 
@@ -242,7 +260,8 @@ bool fuse_wait_on() {
     }
     return per_dev[dev] == 2;
 #else
-    return false;
+    static const bool on = env_on("STRATA_FUSE_WAIT");   // QWEN3.8 PIANO_VELOCE: opt-in on CUDA
+    return on;
 #endif
 }
 
@@ -512,6 +531,10 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : df_join_)
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (pl_logits_) cudaFree(pl_logits_);
+    if (pl_w_) cudaFree(pl_w_);
+    if (pred_head_) cudaFree(pred_head_);
+    if (h_pred_) cudaFreeHost(h_pred_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_};
     for (void* h : hosts)
@@ -621,6 +644,65 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (const char* pg = std::getenv("STRATA_PRED_GPU"); pg != nullptr && std::atoi(pg) != 0 && g.n_expert == 512 && K == 10) {
+        pred_stride_ = (int64_t) (T * K);
+        if (const char* pa = std::getenv("STRATA_PRED_AHEAD"); pa != nullptr) pred_ahead_ = std::max(1, std::min(8, std::atoi(pa)));
+        sink_.pred_ahead = pred_ahead_;
+        pred_on_ = mapped((uint64_t) g.n_layers * T * K * 4, (void**) &h_pred_, (void**) &m_pred_) &&
+                   cudaMalloc((void**) &pl_logits_, T * 512 * sizeof(float)) == cudaSuccess &&
+                   cudaMalloc((void**) &pl_w_, T * K * sizeof(float)) == cudaSuccess;
+        if (pred_on_) {
+            for (int64_t i = 0; i < g.n_layers * (int64_t) (T * K); ++i) h_pred_[i] = -1;
+            sink_.pred = h_pred_;
+            sink_.pred_stride = pred_stride_;
+        }
+        if (const char* ph = std::getenv("STRATA_PRED_HEAD"); pred_on_ && ph != nullptr) {
+            const size_t nb = (size_t) g.n_layers * 512 * (size_t) N * 2;
+            std::vector<uint16_t> hb(nb / 2);
+            std::FILE* hf = std::fopen(ph, "rb");
+            const bool rd = hf != nullptr && std::fread(hb.data(), 1, nb, hf) == nb;
+            if (hf) std::fclose(hf);
+            {   // the head's bias and table, when the file has them
+                std::FILE* hf2 = std::fopen(ph, "rb");
+                const size_t nbias = (size_t) g.n_layers * 512 * 4, nE = (size_t) g.n_layers * 512 * 512 * 4;
+                std::vector<float> hbias(nbias / 4), hE(nE / 4);
+                const bool more = hf2 != nullptr && std::fseek(hf2, (long) nb, SEEK_SET) == 0 &&
+                                  std::fread(hbias.data(), 1, nbias, hf2) == nbias && std::fread(hE.data(), 1, nE, hf2) == nE;
+                for (int64_t i = 0; i < g.n_layers && i < 64; ++i) { pred_cal_[i] = 1.0f; pred_cal_[64 + i] = 0.0f; }
+                if (more && g.n_layers <= 64) {   // QWEN3.8 STRATA_PRED_THR: the calibration after the table, when there
+                    std::vector<float> cal(2 * (size_t) g.n_layers);
+                    if (std::fread(cal.data(), 4, cal.size(), hf2) == cal.size()) {
+                        for (int64_t i = 0; i < g.n_layers; ++i) { pred_cal_[i] = cal[i]; pred_cal_[64 + i] = cal[g.n_layers + i]; }
+                        std::fprintf(stderr, "strata verify: prediction head calibration loaded\n");
+                    }
+                }
+                if (hf2) std::fclose(hf2);
+                if (more && cudaMalloc((void**) &pred_bias_, nbias) == cudaSuccess && cudaMalloc((void**) &pred_E_, nE) == cudaSuccess) {
+                    cudaMemcpy(pred_bias_, hbias.data(), nbias, cudaMemcpyHostToDevice);
+                    cudaMemcpy(pred_E_, hE.data(), nE, cudaMemcpyHostToDevice);
+                    std::fprintf(stderr, "strata verify: prediction head with bias and expert table\n");
+                }
+            }
+            if (!rd || cudaMalloc((void**) &pred_head_, nb) != cudaSuccess ||
+                cudaMemcpy(pred_head_, hb.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata verify: STRATA_PRED_HEAD %s not loaded, the next router predicts\n", ph);
+                if (pred_head_) cudaFree(pred_head_);
+                pred_head_ = nullptr;
+            }
+        }
+        if (pred_on_ && mapped((uint64_t) g.n_layers * 4 + 64, (void**) &h_predok_, (void**) &m_predok_)) {
+            for (int64_t i = 0; i < g.n_layers; ++i) h_predok_[i] = 0;
+            pred_layers_ = g.n_layers;
+            sink_.pred_ok = h_predok_;
+            const char* sd = std::getenv("STRATA_PRED_SIDE");
+            pred_side_ = sd != nullptr && std::atoi(sd) != 0 &&
+                         cudaStreamCreateWithFlags(&pred_cs_, cudaStreamNonBlocking) == cudaSuccess &&
+                         cudaEventCreateWithFlags(&pred_fork_, cudaEventDisableTiming) == cudaSuccess &&
+                         cudaEventCreateWithFlags(&pred_join_, cudaEventDisableTiming) == cudaSuccess;
+        }
+        std::fprintf(stderr, "strata verify: GPU expert prediction %s (%s, %d layer(s) ahead%s)\n", pred_on_ ? "on" : "FAILED",
+                     pred_head_ ? "trained head" : "next layer's router", pred_ahead_, pred_side_ ? ", side stream" : "");
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -742,6 +824,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    if (const char* hp = std::getenv("STRATA_HC_PREFETCH"); hp != nullptr && std::atoi(hp) > 0) {   // QWEN3.8
+        if (cudaStreamCreateWithFlags(&hcpf_cs_, cudaStreamNonBlocking) == cudaSuccess &&
+            cudaEventCreateWithFlags(&hcpf_fork_, cudaEventDisableTiming) == cudaSuccess &&
+            cudaEventCreateWithFlags(&hcpf_join_, cudaEventDisableTiming) == cudaSuccess) hcpf_ = std::atoi(hp);
+        std::fprintf(stderr, "strata verify: hc weights of the next layer prefetched into L2: %s\n", hcpf_ ? (hcpf_ > 1 ? "attn + ffn" : "attn") : "FAILED");
     }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
@@ -1071,6 +1159,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
+        if (hcpf_forked_) { cudaStreamWaitEvent(cs, hcpf_join_, 0); hcpf_forked_ = false; }   // QWEN3.8 STRATA_HC_PREFETCH
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
@@ -1464,6 +1553,38 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+        // QWEN3.8 14/10/2026 STRATA_PRED_GPU: the next layer's experts predicted from this layer's MoE input
+        if (pred_on_ && dec_batch && n > 1 && l + pred_ahead_ < g.n_layers && native_router_enabled() && NE == 512 && K == 10) {
+            const LayerView vn(wt, l + pred_ahead_);
+            const WeightRef* wn = vn.get("ffn_gate_inp.weight");
+            const uint16_t* pw = pred_head_ != nullptr ? pred_head_ + (size_t) (l + pred_ahead_) * 512 * (size_t) N
+                                 : wn != nullptr ? (const uint16_t*) wn->data : nullptr;
+            if (pw != nullptr) {
+                cudaStream_t ps = cs;
+                if (pred_side_) {
+                    cudaEventRecord(pred_fork_, cs);
+                    cudaStreamWaitEvent(pred_cs_, pred_fork_, 0);
+                    ps = pred_cs_;
+                }
+                try {
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, pw, pl_logits_ + tb * NE, NE, N, NE, n, ps);
+                    if (pred_head_ != nullptr)
+                        pred_head_add(pl_logits_ + tb * NE, pred_bias_ ? pred_bias_ + (size_t) (l + pred_ahead_) * 512 : nullptr,
+                                      pred_E_ ? pred_E_ + (size_t) (l + pred_ahead_) * 512 * 512 : nullptr, ids_ + tb * K, n, K, ps);
+                    // QWEN3.8 15/10/2026 STRATA_PRED_THR=p: the head's yes/no over the window instead of the top-10 per token
+                    static const float pred_zthr = [] { const char* v = std::getenv("STRATA_PRED_THR"); if (!v) return 1e30f;
+                        const float p = std::min(0.999f, std::max(0.001f, (float) std::atof(v))); return std::log(p / (1.0f - p)); }();
+                    if (pred_zthr < 1e29f && pred_head_ != nullptr)
+                        pred_thr_select(pl_logits_ + tb * NE, n, pred_cal_[l + pred_ahead_], pred_cal_[64 + l + pred_ahead_], pred_zthr,
+                                        m_pred_ + (size_t) (l + pred_ahead_) * (size_t) pred_stride_ + tb * K, (int) (n * K), ps);
+                    else
+                    native_router_top10_multi(pl_logits_ + tb * NE, m_pred_ + (size_t) (l + pred_ahead_) * (size_t) pred_stride_ + tb * K,
+                                              pl_w_ + tb * K, n, ps);
+                    if (m_predok_ != nullptr && grp == G - 1) set_mapped_u32(m_predok_ + (l + pred_ahead_), 1u, ps);
+                    if (pred_side_) { cudaEventRecord(pred_join_, pred_cs_); pred_forked_ = true; }
+                } catch (const std::exception& e) { err = "verify prediction: " + std::string(e.what()); return false; }
+            }
+        }
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
@@ -1488,6 +1609,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                        m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
+            else
+#else
+            if (g_doorbell_store && !(remote_opt_ || always_publish_))   // QWEN3.8 PIANO_VELOCE: the ring stored
+                doorbell_publish_res_value(xm, ids_ + tb * K, hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
+                                           (int) g.n_expert, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N, m_ids_ + tb * K,
+                                           m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
             else
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
@@ -1606,6 +1733,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
+            if (hcpf_ > 0 && G == 1 && l + 1 < le_ && !hcpf_forked_) {   // QWEN3.8 STRATA_HC_PREFETCH
+                const LayerView vn(wt, l + 1);
+                cudaEventRecord(hcpf_fork_, cs);
+                cudaStreamWaitEvent(hcpf_cs_, hcpf_fork_, 0);
+                for (const char* nm : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight", "hc_attn_norm.weight",
+                                       "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight", "hc_ffn_norm.weight"}) {
+                    if (hcpf_ < 2 && std::strncmp(nm, "hc_ffn_", 7) == 0) continue;
+                    const WeightRef* w = vn.get(nm);
+                    if (w != nullptr) l2_prefetch(w->data, w->bytes, hcpf_cs_);
+                }
+                cudaEventRecord(hcpf_join_, hcpf_cs_);
+                hcpf_forked_ = true;
+            }
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
@@ -1649,6 +1789,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        if (pred_forked_) { cudaStreamWaitEvent(cs, pred_join_, 0); pred_forked_ = false; }   // QWEN3.8 STRATA_PRED_SIDE
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
@@ -2060,6 +2201,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_predok_ != nullptr) for (int64_t i = 0; i < 64 && i < pred_layers_; ++i) ((volatile uint32_t*) h_predok_)[i] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2230,6 +2372,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
         const Clock::time_point b = Clock::now();
+        if (g_qw_piano_t) { g_qw_ring = b; g_qw_pub = b; }   // QWEN3.8 STRATA_QW_PIANO_T
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
@@ -2244,6 +2387,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         if (remote_opt_) remote_opt_->end();
+        if (g_qw_piano_t && *(volatile uint32_t*) h_flagA_ == want)   // QWEN3.8: misses = a CPU or PCIe share in the plan
+            qw_piano_fine(sink_.counts[1] > 0 && sink_.counts[2] + 0 >= 0 && (sink_.counts[2] > 0 || sink_.start[sink_.counts[0]] < (int32_t) (n * ss.k)));
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
                               (int64_t) ms_since(b));   // aux: ms the CPU experts took
@@ -2433,6 +2578,7 @@ void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+    if (g_qw_piano_t) g_qw_pub = std::chrono::steady_clock::now();
 }
 
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
@@ -2501,7 +2647,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && !g_qfuse() && one_token_self_commit()) {   // QWEN3.8: QFUSE never self-commits
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2823,6 +2969,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_predok_ != nullptr) for (int64_t i = 0; i < 64 && i < pred_layers_; ++i) ((volatile uint32_t*) h_predok_)[i] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];

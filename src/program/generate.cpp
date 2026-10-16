@@ -4713,7 +4713,7 @@ int main(int argc, char** argv) {
         else if (pin_wddm_cap)
             std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
                                  "(STRATA_ARENA_PIN_GIB changes it)\n");
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
+        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/[] { const char* v = std::getenv("STRATA_ARENA_THREADS"); return v ? std::max(1, std::atoi(v)) : 14; }() /* QWEN3.8 16/10/2026: was 6 */, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -8337,10 +8337,46 @@ int main(int argc, char** argv) {
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
+        // [locale 10/10/2026] STRATA_CLIENT_MEMORY=N: the next round may swap up to N experts (a client switch, below)
+        int adapt_cap_once = 0;
+        // [locale 10/10/2026] the routing counts of each client (a client = the first 64 prompt tokens: its system prompt),
+        // kept when another client takes over and put back when it returns (at most 16 clients)
+        std::map<uint64_t, std::vector<float>> client_mem;
+        std::map<uint64_t, uint64_t> client_seen;   // when each kept client last left (for dropping the oldest)
+        uint64_t client_cur = 0, client_clock = 0;
+        // the current client's slow counts: every round adds the round's (decayed) counts and keeps 0.97 of the old
+        // ones, so they remember ~30 rounds (~400 tokens) where the round's own counts remember ~3
+        std::vector<float> client_acc;
+        static const bool client_on = [] { const char* e = std::getenv("STRATA_CLIENT_MEMORY"); return e && std::atoi(e) > 0; }();
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            const int adapt_cap = adapt_cap_once > 0 ? adapt_cap_once : o.adapt_swaps;
+            adapt_cap_once = 0;
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            // QWEN3.8 15/10/2026 STRATA_CACHE_LIN: la regola della scheda nostra (patch_cachelin.py)
+            static const std::vector<float> lin_w = [] {
+                std::vector<float> w; const char* e = std::getenv("STRATA_CACHE_LIN");
+                if (e) { std::string t(e); size_t p = 0; while (p <= t.size()) { size_t q = t.find(',', p); if (q == std::string::npos) q = t.size();
+                    if (q > p) w.push_back((float) std::atof(t.substr(p, q - p).c_str())); p = q + 1; } }
+                if (!w.empty()) std::fprintf(stderr, "strata serve: STRATA_CACHE_LIN on (%zu weights)\n", w.size());
+                return w.size() == 6 ? w : std::vector<float>{};
+            }();
+            static const float lin_gain = [] { const char* e = std::getenv("STRATA_CACHE_LIN_GAIN"); return e ? (float) std::atof(e) : 0.0f; }();
+            static std::vector<float> lin_c1, lin_c2, lin_c3, lin_prev;
+            std::vector<float> lin_s;
+            if (!lin_w.empty()) {
+                const size_t N = drive.d.usage.size();
+                if (lin_c1.size() != N) { lin_c1.assign(N, 0.0f); lin_c2.assign(N, 0.0f); lin_c3.assign(N, 0.0f); lin_prev.assign(N, 0.0f); }
+                lin_s.resize(N);
+                const float d1 = 0.6561f, d2 = 0.88529281f, d3 = 0.98014963f;   // 0,9^4  0,97^4  0,995^4
+                for (size_t i = 0; i < N; ++i) {
+                    const float u = drive.d.usage[i], inc = std::max(0.0f, u - lin_prev[i]);
+                    lin_c1[i] = lin_c1[i] * d1 + inc; lin_c2[i] = lin_c2[i] * d2 + inc; lin_c3[i] = lin_c3[i] * d3 + inc;
+                    lin_s[i] = lin_w[0] * std::log1p(u) + lin_w[1] * std::log1p(lin_c1[i]) + lin_w[2] * std::log1p(lin_c2[i]) +
+                               lin_w[3] * std::log1p(lin_c3[i]) + lin_w[4] * std::log1p(inc) + lin_w[5] * (host_res[i] >= 0 ? 1.0f : 0.0f);
+                }
+            }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -8348,10 +8384,11 @@ int main(int argc, char** argv) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
+                const float* sc = lin_s.empty() ? u : lin_s.data() + l * g.n_expert;   // QWEN3.8 STRATA_CACHE_LIN
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(sc[e], e); }
+                    else vict.emplace_back(sc[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -8359,12 +8396,12 @@ int main(int argc, char** argv) {
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
                 for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
+                    if (cand[i].first < vict[i].first + (lin_s.empty() ? o.adapt_min_gain : lin_gain)) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if ((int) swaps.size() > adapt_cap) swaps.resize((size_t) adapt_cap);
             if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
                 agate.landed.store(-1, std::memory_order_release);
@@ -8475,6 +8512,10 @@ int main(int argc, char** argv) {
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
             // is empty
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
+            if (client_on) {   // [locale 10/10/2026] the client's slow counts (STRATA_CLIENT_MEMORY)
+                if (client_acc.size() != drive.d.usage.size()) client_acc.assign(drive.d.usage.size(), 0.0f);
+                for (size_t i = 0; i < client_acc.size(); ++i) client_acc[i] = client_acc[i] * 0.97f + drive.d.usage[i];
+            }
             if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
                 std::vector<int32_t> r0 = host_res;
                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
@@ -8486,6 +8527,7 @@ int main(int argc, char** argv) {
                 }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
+            if (!lin_s.empty()) lin_prev = drive.d.usage;   // QWEN3.8 STRATA_CACHE_LIN: l'uso dopo lo scambio, per l'uso del blocco dopo
             return true;
         };
         // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where
@@ -9894,6 +9936,10 @@ int main(int argc, char** argv) {
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                        {   // QWEN3.8 15/10/2026: STRATA_SESSION_NO_FLUSH=1 - no forced flush before the rename
+                            static const bool no_flush = [] { const char* v = std::getenv("STRATA_SESSION_NO_FLUSH"); return v && v[0] == '1'; }();
+                            if (no_flush) wo.durable = false;
+                        }
                         wo.progress = moving;
                         wo.phase = blocking;
                         strata::core::SessionStatus st;
@@ -11132,6 +11178,56 @@ int main(int argc, char** argv) {
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
+            // [locale 10/10/2026] STRATA_CLIENT_MEMORY=N (0/absent: off).  When the client changes (WorkFlow's mail
+            // between two LLM_coder turns), the VRAM cache holds the other client's experts and the first windows of the
+            // turn run with many misses.  Keep the leaving client's routing counts, put back the arriving client's and
+            // swap up to N experts towards them before the first window (the copies land while it runs).
+            static const int client_burst = [] { const char* e = std::getenv("STRATA_CLIENT_MEMORY"); return e ? std::atoi(e) : 0; }();
+            if (client_burst > 0 && !drive.d.usage.empty() && !ajob && n > 0) {
+                uint64_t key = 1469598103934665603ull;
+                for (int64_t i = 0; i < std::min<int64_t>(n, 64); ++i) { key ^= (uint64_t) ids[(size_t) i]; key *= 1099511628211ull; }
+                if (key != client_cur) {
+                    if (client_cur != 0 && !client_acc.empty()) {
+                        if (client_mem.size() >= 16 && !client_mem.count(client_cur)) {   // the least recently used goes
+                            auto old = std::min_element(client_seen.begin(), client_seen.end(),
+                                                        [](const auto& a, const auto& b) { return a.second < b.second; });
+                            client_mem.erase(old->first);
+                            client_seen.erase(old);
+                        }
+                        client_mem[client_cur] = client_acc;
+                        client_seen[client_cur] = ++client_clock;
+                    }
+                    const auto it = client_mem.find(key);
+                    size_t moved = 0;
+                    if (it != client_mem.end()) {
+                        apply_pending(true);   // the last round's copies have landed: adapt() would skip otherwise
+                        client_acc = it->second;
+                        // the round's counts become the client's slow ones, scaled to the same total as the counts now
+                        // (the swap rule's thresholds - 2 uses, 1.5 more than the evicted - are in those units)
+                        double s_now = 0, s_acc = 0;
+                        for (size_t i = 0; i < client_acc.size(); ++i) { s_now += drive.d.usage[i]; s_acc += client_acc[i]; }
+                        const float k = s_acc > 0 ? (float) (std::max(s_now, 1.0) / s_acc) : 0.0f;
+                        for (size_t i = 0; i < client_acc.size(); ++i) drive.d.usage[i] = client_acc[i] * k;
+                        adapt_cap_once = client_burst;
+                        if (!adapt()) {
+                            std::printf("ERR the client switch's swaps failed\n");
+                            return 1;
+                        }
+                        moved = pending.size();
+                    } else {
+                        std::fill(client_acc.begin(), client_acc.end(), 0.0f);   // a new client starts its own counts
+                    }
+                    // the first prompt ids too, so that a reader (Model Status) can name the client with the tokenizer
+                    std::string first_ids;
+                    for (int64_t i = 0; i < std::min<int64_t>(n, 96); ++i) first_ids += " " + std::to_string((long long) ids[(size_t) i]);
+                    std::fprintf(stderr, "strata serve: client %016llx %s (%zu swaps) ids:%s\n", (unsigned long long) key,
+                                 it != client_mem.end() ? "back: its experts swapped in" : "new", moved, first_ids.c_str());
+                    client_cur = key;
+                } else {
+                    // one line for every request (Model Status pairs them with the requests of /metrics, in order)
+                    std::fprintf(stderr, "strata serve: client %016llx same\n", (unsigned long long) key);
+                }
+            }
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
@@ -11920,6 +12016,16 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                {   // [locale 15/10/2026] STRATA_MTP_DUMP_PROB=K: the model's distribution at the kept rows 0..a
+                    static const int prob_k = [] { const char* v = std::getenv("STRATA_MTP_DUMP_PROB");
+                                                   return v ? std::atoi(v) : 0; }();
+                    if (prob_k > 0 && use_mtp && !first_window) {
+                        static std::vector<float> row;
+                        row.resize((size_t) ver.vocab());
+                        for (int r = 0; r <= a; ++r)
+                            if (ver.copy_logits(r, row.data())) mtp.dump_probs(p + r, row.data(), ver.vocab(), prob_k);
+                    }
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)

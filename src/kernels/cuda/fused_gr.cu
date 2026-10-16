@@ -799,16 +799,134 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
 }
 
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
-__device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
+__device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int nthreads = THREADS) {
+    for (int i = t; i < T * (H_TILE / 4); i += nthreads) {
         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
         const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
     }
 }
 
-template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
-__global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+// QWEN3.8 15/10/2026 (STRATA_GR_DOWN_DIRECT): gr_down_staged_kernel without the shared-memory staging - each warp reads
+// the activations itself (L2-resident), no __syncthreads; the same dot8u on the same float4 in the same order.
+template <int MAX_T, bool EXACT_T, int TPB = THREADS>   // TPB 128: 81 blocks (STRATA_GR_DOWN_DIRECT=2)
+__global__ void __launch_bounds__(TPB) gr_down_direct_kernel(GrMulti m) {
+    constexpr int DWARPS = TPB / 32, DBLOCKS = LR / DWARPS;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == DBLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * DWARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    if (!active) return;
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) row * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const float4* x4 = reinterpret_cast<const float4*>(m.xn);
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+#pragma unroll
+    for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const int j = lane + 32 * q;
+            const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+            for (int k = 0; k < MAX_T; ++k) {
+                if (EXACT_T || k < T) {
+                    const float4* xk = x4 + ((size_t) k * D + (size_t) h * H_TILE) / 4;
+                    acc[k] += dot8u(wvq, __ldg(xk + 2 * j), __ldg(xk + 2 * j + 1));
+                }
+            }
+        }
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) {
+            m.a[k].inject_out[row] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// QWEN3.8 15/10/2026 (STRATA_GR_DOWN_DIRECT=3): 4 rows a warp, one warp a block - the activations read once for 4 rows.
+template <int MAX_T>
+__global__ void __launch_bounds__(32) gr_down_r4_kernel(GrMulti m) {
+    const int lane = threadIdx.x;
+    const bool inject_block = blockIdx.x == LR / 4;
+    if (inject_block && m.a[0].w_inject == nullptr) return;
+    const int row0 = inject_block ? 0 : blockIdx.x * 4;
+    const uint16_t* base = inject_block ? m.a[0].w_inject : m.a[0].w_down;
+    const uint4* w4[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) w4[r] = reinterpret_cast<const uint4*>(base + (size_t) (row0 + r) * D);
+    const float4* x4 = reinterpret_cast<const float4*>(m.xn);
+    float acc[4][MAX_T];
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) acc[r][k] = 0.0f;
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        uint4 wv[4][HQ];
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[r][q] = __ldg(w4[r] + h * (H_TILE / 8) + lane + 32 * q);
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const int j = lane + 32 * q;
+            float4 xa[MAX_T], xb[MAX_T];
+#pragma unroll
+            for (int k = 0; k < MAX_T; ++k) {
+                const float4* xk = x4 + ((size_t) k * D + (size_t) h * H_TILE) / 4;
+                xa[k] = __ldg(xk + 2 * j); xb[k] = __ldg(xk + 2 * j + 1);
+            }
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const Bf16x8 wvq = unpack8(wv[r][q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) acc[r][k] += dot8u(wvq, xa[k], xb[k]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        float s[MAX_T];
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) s[k] = warp_sum(acc[r][k]);
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            if (lane != k) continue;
+            if (inject_block) {
+                m.a[k].inject_out[r] = s[k];
+            } else {
+                const float x = s[k] / (float) HC;
+                m.a[k].lo[row0 + r] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+}
+
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int TPB = THREADS>
+__global__ void __launch_bounds__(TPB) gr_down_staged_kernel(GrMulti m) {
+    constexpr int WARPS = TPB / 32, DOWN_BLOCKS = LR / WARPS;   // QWEN3.8: STRATA_GR_DOWN_TPB
     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = EXACT_T ? MAX_T : m.T;
@@ -826,9 +944,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 #pragma unroll
         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
     }
-    stage_htile(m, T, 0, hbuf, t);
+    stage_htile(m, T, 0, hbuf, t, TPB);
     cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t);
+    stage_htile(m, T, 1, hbuf + buf_f4, t, TPB);
     cp_async_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
@@ -855,7 +973,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
             }
         }
         __syncthreads();                                // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, TPB);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -957,6 +1075,10 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<6, true>, 6);
         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        set_staged_attr(gr_down_staged_kernel<1, true, 128>, 1); set_staged_attr(gr_down_staged_kernel<2, true, 128>, 2);
+        set_staged_attr(gr_down_staged_kernel<3, true, 128>, 3); set_staged_attr(gr_down_staged_kernel<4, true, 128>, 4);
+        set_staged_attr(gr_down_staged_kernel<1, true, 64>, 1); set_staged_attr(gr_down_staged_kernel<2, true, 64>, 2);
+        set_staged_attr(gr_down_staged_kernel<3, true, 64>, 3); set_staged_attr(gr_down_staged_kernel<4, true, 64>, 4);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -1018,7 +1140,8 @@ bool norm_fast_on() {
     }
     return per_dev[dev] == 2;
 #else
-    return false;
+    static const bool on = [] { const char* e = std::getenv("STRATA_GR_NORM_FAST"); return e != nullptr && std::atoi(e) != 0; }();   // QWEN3.8
+    return on;
 #endif
 }
 
@@ -1072,6 +1195,43 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
+            static const int down_tpb = [] { const char* e = std::getenv("STRATA_GR_DOWN_TPB"); const int v = e ? std::atoi(e) : 256; return v == 128 || v == 64 ? v : 256; }();
+            static const int down_direct = [] { const char* e = std::getenv("STRATA_GR_DOWN_DIRECT"); return e ? std::atoi(e) : 0; }();
+            if (down_direct == 3 && exact_t && ct <= 6) {   // QWEN3.8 15/10/2026: 4 rows a warp
+                if (ct == 1) gr_down_r4_kernel<1><<<LR / 4 + 1, 32, 0, st>>>(c);
+                else if (ct == 2) gr_down_r4_kernel<2><<<LR / 4 + 1, 32, 0, st>>>(c);
+                else if (ct == 3) gr_down_r4_kernel<3><<<LR / 4 + 1, 32, 0, st>>>(c);
+                else if (ct == 4) gr_down_r4_kernel<4><<<LR / 4 + 1, 32, 0, st>>>(c);
+                else if (ct == 5) gr_down_r4_kernel<5><<<LR / 4 + 1, 32, 0, st>>>(c);
+                else gr_down_r4_kernel<6><<<LR / 4 + 1, 32, 0, st>>>(c);
+            } else
+            if (down_direct == 2 && exact_t && ct <= 6) {   // QWEN3.8 15/10/2026: GR_DOWN_DIRECT=2, 81 blocks of 4 warps
+                if (ct == 1) gr_down_direct_kernel<1, true, 128><<<LR / 4 + 1, 128, 0, st>>>(c);
+                else if (ct == 2) gr_down_direct_kernel<2, true, 128><<<LR / 4 + 1, 128, 0, st>>>(c);
+                else if (ct == 3) gr_down_direct_kernel<3, true, 128><<<LR / 4 + 1, 128, 0, st>>>(c);
+                else if (ct == 4) gr_down_direct_kernel<4, true, 128><<<LR / 4 + 1, 128, 0, st>>>(c);
+                else if (ct == 5) gr_down_direct_kernel<5, true, 128><<<LR / 4 + 1, 128, 0, st>>>(c);
+                else gr_down_direct_kernel<6, true, 128><<<LR / 4 + 1, 128, 0, st>>>(c);
+            } else
+            if (down_direct == 1 && exact_t && ct <= 6) {   // QWEN3.8 15/10/2026: no staging, no __syncthreads
+                if (ct == 1) gr_down_direct_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(c);
+                else if (ct == 2) gr_down_direct_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(c);
+                else if (ct == 3) gr_down_direct_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(c);
+                else if (ct == 4) gr_down_direct_kernel<4, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(c);
+                else if (ct == 5) gr_down_direct_kernel<5, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(c);
+                else gr_down_direct_kernel<6, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(c);
+            } else
+            if (exact_t && ct <= 4 && down_tpb == 128) {   // QWEN3.8: 81 blocchi da 4 warp
+                if (ct == 1) gr_down_staged_kernel<1, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+                else if (ct == 2) gr_down_staged_kernel<2, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+                else if (ct == 3) gr_down_staged_kernel<3, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+                else gr_down_staged_kernel<4, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+            } else if (exact_t && ct <= 4 && down_tpb == 64) {   // 161 blocchi da 2 warp (inject: 2 warp, 4 righe -> serve TPB>=128)
+                if (ct == 1) gr_down_staged_kernel<1, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+                else if (ct == 2) gr_down_staged_kernel<2, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+                else if (ct == 3) gr_down_staged_kernel<3, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+                else gr_down_staged_kernel<4, true, 128><<<LR / 4 + 1, 128, smem, st>>>(c);
+            } else
             if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else if (exact_t && ct == 2) gr_down_staged_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else if (exact_t && ct == 3) gr_down_staged_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);

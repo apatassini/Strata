@@ -17,6 +17,7 @@
 #include "strata/kernels/cpu/kq_avx2.hpp"
 
 #include <cuda_runtime.h>
+#include <immintrin.h>   // QWEN3.8: _mm_cvtps_ph del registratore degli esperti
 
 #include <algorithm>
 #include <atomic>
@@ -2231,6 +2232,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
     ++st_layers_;
     if (pstamp_[(size_t) layer].load(std::memory_order_acquire) != gen_.load(std::memory_order_relaxed) + 1) {
         ++st_nopred_;
+        if (layer == (int64_t) routers_.size() - 1 && (++st_windows_ % 100) == 0) stats_print();   // QWEN3.8
         return;
     }
     std::vector<uint64_t> act((size_t) words_, 0);
@@ -2282,7 +2284,11 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
         st_hit_[s] += hit;
         st_pred_[s] += np;
     }
-    if (layer == (int64_t) routers_.size() - 1 && (++st_windows_ % 100) == 0) {
+    if (layer == (int64_t) routers_.size() - 1 && (++st_windows_ % 100) == 0) stats_print();
+}
+
+void RouterLookahead::stats_print() {
+    {
         const uint64_t scored = st_layers_ - st_nopred_;
         std::fprintf(stderr, "strata lookahead stats: %llu windows, %llu layers scored, %llu without a prediction (%.1f%%); "
                      "%.2f actual non-resident experts/layer;",
@@ -3621,10 +3627,47 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+// QWEN3.8 14/10/2026: STRATA_ROUTE_DUMP (formato in _temp\velocita\patch_routedump.py)
+static void route_dump(const ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k) {
+    static std::FILE* f = [] { const char* p = std::getenv("STRATA_ROUTE_DUMP"); return p ? std::fopen(p, "wb") : (std::FILE*) nullptr; }();
+    static const uint64_t cap = [] { const char* c = std::getenv("STRATA_ROUTE_DUMP_MB"); return (uint64_t) (c ? std::atoll(c) : 4096) << 20; }();
+    static uint64_t written = 0;
+    if (f == nullptr || written >= cap || n_tok < 1 || n_tok > 64 || k < 1 || k > 64) return;
+    // STRATA_ROUTE_DUMP_EVERY=N: one window in N (whole windows: the window count rises at layer 0)
+    static const int every = [] { const char* e = std::getenv("STRATA_ROUTE_DUMP_EVERY"); return e ? std::max(1, std::atoi(e)) : 1; }();
+    static uint64_t win = 0;
+    if (d.layers == 0) ++win;
+    if (win % (uint64_t) every != 0) return;
+    constexpr int HH = strata::kernels::cpu::H;
+    const int32_t head[4] = {0x53445452, (int32_t) d.layers, (int32_t) n_tok, (int32_t) k};   // 'RTDS' (15/10/2026)
+    std::fwrite(head, sizeof head, 1, f);
+    std::fwrite(&win, sizeof win, 1, f);
+    std::fwrite(ids, sizeof(int32_t), (size_t) (n_tok * k), f);
+    uint8_t res[64 * 64];
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        const int32_t e = ids[i];
+        res[i] = (uint8_t) (d.host_res != nullptr && e >= 0 && e < 512 && d.host_res[(size_t) (d.layers * 512 + e)] >= 0);
+    }
+    std::fwrite(res, 1, (size_t) (n_tok * k), f);
+    uint8_t in_scheda[64] = {};   // tutti gli esperti dello strato in scheda adesso, un bit ciascuno
+    if (d.host_res != nullptr)
+        for (int e = 0; e < 512; ++e)
+            if (d.host_res[(size_t) (d.layers * 512 + e)] >= 0) in_scheda[e >> 3] |= (uint8_t) (1u << (e & 7));
+    std::fwrite(in_scheda, 1, sizeof in_scheda, f);
+    static std::vector<uint16_t> h;
+    h.resize((size_t) (n_tok * HH));
+    for (int64_t i = 0; i + 8 <= n_tok * HH; i += 8)
+        _mm_storeu_si128((__m128i*) (h.data() + i), _mm256_cvtps_ph(_mm256_loadu_ps(x_f + i), 0));
+    std::fwrite(h.data(), sizeof(uint16_t), h.size(), f);
+    written += sizeof head + 8 + 64 + (uint64_t) (n_tok * k) * 5 + h.size() * 2;
+    if (written >= cap) std::fflush(f);
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
+    route_dump(d, x_f, ids, n_tok, k);   // QWEN3.8
     if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
@@ -3790,6 +3833,38 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        // QWEN3.8 14/10/2026 STRATA_PRED_GPU: the experts the GPU predicted for the next layer, that no cache holds, go to
+        // the Foresight slots now (one layer of time for the copy); the next layer's plan takes the landed ones
+        bool pred_ready = P.pred_ok == nullptr && n_tok > 1;
+        if (P.pred_ok != nullptr && n_tok > 1 && d.layers + P.pred_ahead < lay.n_layers) {   // QWEN3.8: at most ~30 us
+            const volatile uint32_t* ok = (const volatile uint32_t*) P.pred_ok + (d.layers + P.pred_ahead);
+            for (int spin = 0; spin < 3000 && *ok == 0; ++spin) _mm_pause();
+            pred_ready = *ok != 0;
+        }
+        if (pred_ready && P.pred != nullptr && d.fs != nullptr && d.layers + P.pred_ahead < lay.n_layers) {
+            // STRATA_PRED_MAX=M: only the M best (votes of the window's tokens, weighted by rank 10..1) are copied
+            static const int pred_max = [] { const char* v = std::getenv("STRATA_PRED_MAX"); return v ? std::max(1, std::atoi(v)) : 640; }();
+            const int32_t* pr = P.pred + (size_t) (d.layers + P.pred_ahead) * (size_t) P.pred_stride;
+            int32_t seen[64 * 10];
+            int score[64 * 10];
+            int ns = 0;
+            for (int64_t i = 0; i < n_tok * 10 && i < P.pred_stride; ++i) {
+                const int32_t e = ((volatile const int32_t*) pr)[i];
+                if (e < 0 || e >= d.n_expert) continue;
+                if (d.host_res[(size_t) (d.layers + P.pred_ahead) * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                int j = 0;
+                while (j < ns && seen[j] != e) ++j;
+                if (j == ns) { seen[ns] = e; score[ns] = 0; ++ns; }
+                static const bool pred_thr_on = std::getenv("STRATA_PRED_THR") != nullptr;   // QWEN3.8 STRATA_PRED_THR: already ordered
+                score[j] += pred_thr_on ? (int) (100000 - i) : 10 - (int) (i % 10);
+            }
+            for (int c = 0; c < ns && c < pred_max; ++c) {   // the best first
+                int b = c;
+                for (int j = c + 1; j < ns; ++j) if (score[j] > score[b]) b = j;
+                std::swap(seen[c], seen[b]); std::swap(score[c], score[b]);
+                d.fs->predict(d.src, d.layers + P.pred_ahead, seen[c]);
+            }
+        }
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];

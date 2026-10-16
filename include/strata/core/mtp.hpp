@@ -45,7 +45,16 @@ public:
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768, const MtpDrafter* shared = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
-    void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    void set_prompt_len(int64_t n) { prompt_len_ = n; dump_request(n); }
+    /// [locale 14/10/2026] STRATA_MTP_DUMP=<dir>: a new request begins (its prompt is n tokens long)
+    void dump_request(int64_t n);
+    /// [locale 15/10/2026] STRATA_MTP_DUMP_PROB=K: the model's top-K next-token distribution at `cell` (logits row)
+    void dump_probs(int64_t cell, const float* logits, int64_t n_vocab, int K);
+    /// [locale 14/10/2026] STRATA_MTP_DUMP: n device rows of the final residual with the token each one is paired with
+    void dump_rows(const float* R_dev, const int32_t* tokens, int64_t n, int64_t cell0);
+    /// [locale 14/10/2026] STRATA_MTP_DUMP: the prompt's rows (only the last STRATA_MTP_DUMP_PROMPT cells are kept);
+    /// R_dev may come from another stream (the device is synchronized first)
+    void dump_prompt(const float* R_dev, const int32_t* tokens, int64_t n, int64_t cell0);
     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
     /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
     /// table.  nullptr switches it off.

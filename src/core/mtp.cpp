@@ -36,6 +36,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <ctime>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -54,6 +56,37 @@ namespace strata::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
+
+// ---- [locale 14/10/2026] STRATA_MTP_DUMP: the drafter's inputs on disk, to train the draft layer on our own traffic
+struct MtpDump {
+    std::FILE* f = nullptr;
+    bool tried = false, full = false;
+    uint64_t req = 0;
+    uint64_t bytes = 0, cap = 0;
+    int64_t prompt_keep = 512;
+    std::vector<float> host;
+    std::vector<uint16_t> bf;
+    bool open() {
+        if (tried) return f != nullptr;
+        tried = true;
+        const char* dir = std::getenv("STRATA_MTP_DUMP");
+        if (dir == nullptr || *dir == 0) return false;
+        const char* gb = std::getenv("STRATA_MTP_DUMP_GB");
+        cap = (uint64_t) ((gb && *gb) ? std::atof(gb) : 60.0) * 1024ull * 1024ull * 1024ull;
+        if (const char* pk = std::getenv("STRATA_MTP_DUMP_PROMPT")) prompt_keep = std::max<int64_t>(0, std::atoll(pk));
+        std::time_t now = std::time(nullptr);
+        char name[64];
+        std::strftime(name, sizeof name, "dump-%Y%m%d-%H%M%S.bin", std::localtime(&now));
+        const std::string path = std::string(dir) + "/" + name;
+        f = std::fopen(path.c_str(), "wb");
+        std::fprintf(stderr, "strata mtp-dump: %s %s (cap %.0f GB, prompt rows kept %lld)\n", f ? "writing" : "cannot open",
+                     path.c_str(), cap / 1073741824.0, (long long) prompt_keep);
+        return f != nullptr;
+    }
+    void w(const void* p, size_t n) { std::fwrite(p, 1, n, f); bytes += n; }
+};
+MtpDump g_dump;
+const bool g_dump_on = std::getenv("STRATA_MTP_DUMP") != nullptr;
 
 // #783 PR-i: STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
 bool mtp_catchup_all() {
@@ -1170,6 +1203,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         return false;
 #endif
     }();
+    if (g_dump_on) dump_prompt(R_rows, next_tokens, n, cell0);   // [locale 14/10/2026]
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
@@ -1355,6 +1389,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         };
         wait_step(0);
+        if (top2_env()) record_top2(0);   // QWEN3.8: record_top2 (0.1.43 never called it)
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
@@ -1367,6 +1402,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             (void) cudaStreamQuery(cs_);
             prefetch_ple(drafts[j - 1]);
             wait_step(j);
+            if (top2_env()) record_top2(j);   // QWEN3.8: record_top2
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
@@ -1380,6 +1416,13 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (g_dump_on) dump_rows(window_R_, tokens, a + 1, p);   // [locale 14/10/2026]
+    if (g_dump_on && g_dump.f != nullptr && !g_dump.full && n > 0) {   // [locale 14/10/2026] the drafts of this round
+        const int64_t cell = p + a;
+        const int32_t n32 = n;
+        g_dump.w("DRFT", 4); g_dump.w(&g_dump.req, 8); g_dump.w(&cell, 8); g_dump.w(&n32, 4);
+        g_dump.w(drafts, (size_t) n * 4);
+    }
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
@@ -1509,6 +1552,81 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
         }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+}
+
+
+void MtpDrafter::dump_probs(int64_t cell, const float* logits, int64_t n_vocab, int K) {   // [locale 15/10/2026]
+    if (K <= 0 || n_vocab <= 0 || !g_dump.open() || g_dump.full) return;
+    K = (int) std::min<int64_t>(K, n_vocab);
+    float mx = logits[0];
+    for (int64_t i = 1; i < n_vocab; ++i) mx = std::max(mx, logits[i]);
+    double sum = 0.0;
+    for (int64_t i = 0; i < n_vocab; ++i) sum += std::exp((double) (logits[i] - mx));
+    static std::vector<int32_t> idx;
+    idx.resize((size_t) n_vocab);
+    for (int64_t i = 0; i < n_vocab; ++i) idx[(size_t) i] = (int32_t) i;
+    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                      [&](int32_t x, int32_t y) { return logits[x] > logits[y]; });
+    std::vector<float> pr((size_t) K);
+    for (int k = 0; k < K; ++k) pr[(size_t) k] = (float) (std::exp((double) (logits[idx[(size_t) k]] - mx)) / sum);
+    const int32_t k32 = K;
+    g_dump.w("PROB", 4);
+    g_dump.w(&g_dump.req, 8);
+    g_dump.w(&cell, 8);
+    g_dump.w(&k32, 4);
+    g_dump.w(idx.data(), (size_t) K * 4);
+    g_dump.w(pr.data(), (size_t) K * 4);
+}
+
+void MtpDrafter::dump_request(int64_t n) {
+    if (!g_dump.open() || g_dump.full) return;
+    ++g_dump.req;
+    g_dump.w("RQST", 4);
+    g_dump.w(&g_dump.req, 8);
+    g_dump.w(&n, 8);
+}
+
+void MtpDrafter::dump_prompt(const float* R_dev, const int32_t* tokens, int64_t n, int64_t cell0) {
+    if (!g_dump_on) return;
+    const int64_t HCN = g_->hc * g_->n_embd;
+    const int64_t keep_from = prompt_len_ > 0 ? prompt_len_ - g_dump.prompt_keep : 0;
+    const int64_t i0 = std::max<int64_t>(0, keep_from - cell0);
+    if (i0 >= n) return;
+    cudaDeviceSynchronize();
+    dump_rows(R_dev + (size_t) i0 * HCN, tokens + i0, n - i0, cell0 + i0);
+}
+
+void MtpDrafter::dump_rows(const float* R_dev, const int32_t* tokens, int64_t n, int64_t cell0) {
+    if (n <= 0 || !g_dump.open() || g_dump.full) return;
+    if (g_dump.bytes > g_dump.cap) {
+        g_dump.full = true;
+        std::fflush(g_dump.f);
+        std::fprintf(stderr, "strata mtp-dump: the cap is reached, the recorder stops\n");
+        return;
+    }
+    const int64_t W = g_->hc * g_->n_embd;
+    g_dump.host.resize((size_t) (n * W));
+    if (cudaMemcpyAsync(g_dump.host.data(), R_dev, (size_t) (n * W) * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
+        std::fprintf(stderr, "strata mtp-dump: a copy failed, the recorder stops\n");
+        g_dump.full = true;
+        return;
+    }
+    g_dump.bf.resize(g_dump.host.size());
+    for (size_t i = 0; i < g_dump.host.size(); ++i) {   // round to nearest even
+        uint32_t u;
+        std::memcpy(&u, &g_dump.host[i], 4);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        g_dump.bf[i] = (uint16_t) (u >> 16);
+    }
+    const int32_t n32 = (int32_t) n, w32 = (int32_t) W;
+    g_dump.w("ROWS", 4);
+    g_dump.w(&g_dump.req, 8);
+    g_dump.w(&cell0, 8);
+    g_dump.w(&n32, 4);
+    g_dump.w(&w32, 4);
+    g_dump.w(tokens, (size_t) n * 4);
+    g_dump.w(g_dump.bf.data(), g_dump.bf.size() * 2);
 }
 
 }  // namespace strata::core

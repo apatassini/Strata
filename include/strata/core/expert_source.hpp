@@ -269,6 +269,7 @@ public:
     bool stats_on() const { return stats_on_; }
     void stats_window_start() { gen_.fetch_add(1, std::memory_order_relaxed); }
     void stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num = 0);
+    void stats_print();   // QWEN3.8 14/10/2026: the stats line, also after a layer without a prediction
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
@@ -330,6 +331,12 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// QWEN3.8 14/10/2026 (STRATA_PRED_GPU): the GPU's prediction of each layer's experts, written by the layer
+    /// before (mapped host memory, `pred_stride` ids per layer: token t's top-10 at t * 10); null = off
+    const int32_t* pred = nullptr;
+    int64_t pred_stride = 0;
+    int pred_ahead = 1;   ///< the prediction written at layer l is for layer l + pred_ahead
+    const uint32_t* pred_ok = nullptr;   ///< per layer: 1 = this window's prediction has landed (null = always)
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).

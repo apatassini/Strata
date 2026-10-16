@@ -469,6 +469,22 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    // QWEN3.8 14/10/2026: STRATA_PRED_GPU (patch_predgpu.py)
+    bool pred_on_ = false;
+    int64_t pred_stride_ = 0;
+    int32_t* h_pred_ = nullptr; int32_t* m_pred_ = nullptr;
+    float* pl_logits_ = nullptr; float* pl_w_ = nullptr;
+    int pred_ahead_ = 1;   // STRATA_PRED_AHEAD: the layer predicted is l + pred_ahead_
+    uint16_t* pred_head_ = nullptr;   // STRATA_PRED_HEAD: 48 x 512 x n_embd bf16 on the device, null = the next router
+    float pred_cal_[2 * 64] = {};   // QWEN3.8 STRATA_PRED_THR: cal_a[48], cal_b[48] of the head (host)
+    float* pred_bias_ = nullptr; float* pred_E_ = nullptr;   // the head's bias (48x512) and table (48x512x512)
+    bool pred_side_ = false, pred_forked_ = false;           // STRATA_PRED_SIDE
+    cudaStream_t pred_cs_ = nullptr; cudaEvent_t pred_fork_ = nullptr, pred_join_ = nullptr;
+    uint32_t* h_predok_ = nullptr; uint32_t* m_predok_ = nullptr;
+    int64_t pred_layers_ = 0;
+    // QWEN3.8 14/10/2026: STRATA_HC_PREFETCH (patch_hcpf.py)
+    int hcpf_ = 0; bool hcpf_forked_ = false;
+    cudaStream_t hcpf_cs_ = nullptr; cudaEvent_t hcpf_fork_ = nullptr, hcpf_join_ = nullptr;
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
