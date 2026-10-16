@@ -1,3 +1,6 @@
+> **This is Alessandro Patassini's fork.** What I changed and measured running Qwen3.8-Flash-Next on a 16 GB card is in
+> **[QWEN38.md](QWEN38.md)**; below is the upstream README, unchanged.
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
