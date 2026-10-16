@@ -53,7 +53,7 @@ The router push (`STRATA_ROUTE_PRIOR=1.0`) changes answers a little; I checked q
   [`client-memory`](https://github.com/apatassini/Strata/tree/client-memory) ([#2775](https://github.com/Niko1221/Strata/pull/2775)),
   [`arena-load-threads`](https://github.com/apatassini/Strata/tree/arena-load-threads) ([#2776](https://github.com/Niko1221/Strata/pull/2776)),
   [`vision-parallel-start`](https://github.com/apatassini/Strata/tree/vision-parallel-start) ([#2777](https://github.com/Niko1221/Strata/pull/2777)).
-- `qwen38-vetrina` (this branch): everything I run, on top of 0.1.43.
+- `qwen38-16gb` (this branch): everything I run, on top of 0.1.43.
 
 Speeds depend a lot on the card, the RAM and the kind of text: these are one PC's numbers, not a promise.
 

@@ -52,12 +52,12 @@ difference was the **context**: the engine gives the head the last 16,384 tokens
 Recipe: record the head's inputs in the engine (a recorder patch), train on whole requests and whole conversations
 (long-context attention in chunks to fit 16 GB), one pass (a second one memorises), with the model's own probabilities as
 soft targets. I also use a draft vocabulary that includes Italian words; **anyone can do the same with the language and the
-vocabulary of their own work**. The recorder patch is in the `qwen38-vetrina` branch (`STRATA_MTP_DUMP`).
+vocabulary of their own work**. The recorder patch is in the `qwen38-16gb` branch (`STRATA_MTP_DUMP`).
 
 ## Branches
 - `short-prompt-reads`, `client-memory`, `arena-load-threads`, `vision-parallel-start`: one improvement each, on top of
   upstream `296b59d` (0.1.44.1), meant as pull requests.
-- `qwen38-vetrina` (this page): everything I run, on top of 0.1.43 (`7695859`), including the opt-in experiments above and the recorders
+- `qwen38-16gb` (this branch): everything I run, on top of 0.1.43 (`7695859`), including the opt-in experiments above and the recorders
   (`STRATA_MTP_DUMP`, `STRATA_ROUTE_DUMP`).
 
 License: MIT, as upstream.
