@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="356" viewBox="0 0 860 356" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<rect x="0.5" y="0.5" width="859" height="355" rx="10" fill="#1a1a19" stroke="#33332f"/>
+<text x="24" y="34" font-size="17" font-weight="600" fill="#f0efec">How much faster than before</text>
+<text x="24" y="56" font-size="12.5" fill="#c3c2b7">% faster, same PC, same model (Q2_0), server at 262,144 tokens of context</text>
+<line x1="270.0" y1="68" x2="270.0" y2="312" stroke="#33332f" stroke-width="1"/>
+<text x="270.0" y="330" font-size="11.5" fill="#8f8e86" text-anchor="middle">+0%</text>
+<line x1="361.7" y1="68" x2="361.7" y2="312" stroke="#33332f" stroke-width="1"/>
+<text x="361.7" y="330" font-size="11.5" fill="#8f8e86" text-anchor="middle">+25%</text>
+<line x1="453.3" y1="68" x2="453.3" y2="312" stroke="#33332f" stroke-width="1"/>
+<text x="453.3" y="330" font-size="11.5" fill="#8f8e86" text-anchor="middle">+50%</text>
+<line x1="545.0" y1="68" x2="545.0" y2="312" stroke="#33332f" stroke-width="1"/>
+<text x="545.0" y="330" font-size="11.5" fill="#8f8e86" text-anchor="middle">+75%</text>
+<line x1="636.7" y1="68" x2="636.7" y2="312" stroke="#33332f" stroke-width="1"/>
+<text x="636.7" y="330" font-size="11.5" fill="#8f8e86" text-anchor="middle">+100%</text>
+<text x="258" y="95.5" font-size="13" fill="#f0efec" text-anchor="end">Restart</text>
+<path d="M270.0,81.0 H678.5 Q682.5,81.0 682.5,85.0 V97.0 Q682.5,101.0 678.5,101.0 H270.0 Z" fill="#3987e5"><title>Restart: +112%</title></path>
+<text x="690.5" y="95.5" font-size="13" font-weight="600" fill="#f0efec">+112%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  34 s → 16 s</tspan></text>
+<text x="258" y="129.5" font-size="13" fill="#f0efec" text-anchor="end">Short prompt read (177 tokens)</text>
+<path d="M270.0,115.0 H449.9 Q453.9,115.0 453.9,119.0 V131.0 Q453.9,135.0 449.9,135.0 H270.0 Z" fill="#3987e5"><title>Short prompt read (177 tokens): +50%</title></path>
+<text x="461.9" y="129.5" font-size="13" font-weight="600" fill="#f0efec">+50%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  473 ms → 315 ms</tspan></text>
+<text x="258" y="163.5" font-size="13" fill="#f0efec" text-anchor="end">Cold start</text>
+<path d="M270.0,149.0 H449.3 Q453.3,149.0 453.3,153.0 V165.0 Q453.3,169.0 449.3,169.0 H270.0 Z" fill="#3987e5"><title>Cold start: +50%</title></path>
+<text x="461.3" y="163.5" font-size="13" font-weight="600" fill="#f0efec">+50%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  21 s → 14 s</tspan></text>
+<text x="258" y="197.5" font-size="13" fill="#f0efec" text-anchor="end">Agent steps, 50-190K context</text>
+<path d="M270.0,183.0 H363.8 Q367.8,183.0 367.8,187.0 V199.0 Q367.8,203.0 363.8,203.0 H270.0 Z" fill="#3987e5"><title>Agent steps, 50-190K context: +27%</title></path>
+<text x="375.8" y="197.5" font-size="13" font-weight="600" fill="#f0efec">+27%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  130.1 → 164.8 tok/s</tspan></text>
+<text x="258" y="231.5" font-size="13" fill="#f0efec" text-anchor="end">Agent back after another program</text>
+<path d="M270.0,217.0 H343.0 Q347.0,217.0 347.0,221.0 V233.0 Q347.0,237.0 343.0,237.0 H270.0 Z" fill="#3987e5"><title>Agent back after another program: +21%</title></path>
+<text x="355.0" y="231.5" font-size="13" font-weight="600" fill="#f0efec">+21%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  per-client expert memory</tspan></text>
+<text x="258" y="265.5" font-size="13" fill="#f0efec" text-anchor="end">Real agent job (same task)</text>
+<path d="M270.0,251.0 H337.6 Q341.6,251.0 341.6,255.0 V267.0 Q341.6,271.0 337.6,271.0 H270.0 Z" fill="#3987e5"><title>Real agent job (same task): +20%</title></path>
+<text x="349.6" y="265.5" font-size="13" font-weight="600" fill="#f0efec">+20%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  133.7 → 159.8 tok/s</tspan></text>
+<text x="258" y="299.5" font-size="13" fill="#f0efec" text-anchor="end">Code, short chat</text>
+<path d="M270.0,285.0 H328.7 Q332.7,285.0 332.7,289.0 V301.0 Q332.7,305.0 328.7,305.0 H270.0 Z" fill="#3987e5"><title>Code, short chat: +17%</title></path>
+<text x="340.7" y="299.5" font-size="13" font-weight="600" fill="#f0efec">+17%<tspan font-weight="400" fill="#c3c2b7" font-size="12">  152 → 178 tok/s</tspan></text>
+<line x1="270" y1="68" x2="270" y2="312" stroke="#8f8e86" stroke-width="1"/>
+<text x="24" y="344" font-size="11" fill="#8f8e86">Restart includes a shorter wait in my start script. Measured 10-16/10/2026.</text>
+</svg>

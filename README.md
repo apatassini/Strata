@@ -7,11 +7,30 @@ assistant and Codex. Work done with Claude (Anthropic) as the coding assistant.
 **All the numbers on this page are mine, measured on my PC.** For Strata itself, its install and its own speed tables
 see the [upstream README](https://github.com/Niko1221/Strata#readme).
 
+> [!IMPORTANT]
+> **Every number here is measured with the server at 256K context (262,144 tokens), the way I use it every day.**
+> Many speed tests run with a small context (upstream's own table: 4K answers on 32K prompts). A big context costs
+> speed: on this PC writing at 120-136K tokens of context is ~10-15% slower than under 11K. My agent's prompts are
+> really long (50-190K tokens in the agent benchmark; in today's daily use 28K at the median and up to 192K), and these
+> are the speeds it gets.
+
 ## My PC
 RTX 5070 Ti 16 GB (the model only) + RTX 4060 Ti 8 GB (monitors and the vision encoder), Ryzen 9 7950X, 128 GB DDR5 at
 3800 MT/s, Windows 11. Model: Qwen3.8-Flash-Next Q2_0, one profile of 262,144 tokens.
 
 ## How fast it runs here
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/qwen38/daily-use-dark.svg">
+  <img alt="Real daily use: median 174 tok/s, 40% of the answers at 180+ tok/s, 15% at 200+, fastest 234" src="docs/qwen38/daily-use-light.svg" width="860">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/qwen38/speedups-dark.svg">
+  <img alt="How much faster than before: restart +112%, short prompt read +50%, cold start +50%, agent steps +27%, agent back after another program +21%, real agent job +20%, code short chat +17%" src="docs/qwen38/speedups-light.svg" width="860">
+</picture>
+
+The numbers behind the charts:
 | what | measured | when, how |
 |---|---|---|
 | **writes code, short chat** | **178 tok/s** (152 with the official engine 0.1.41 and default settings) | 12/10/2026, 0.1.43 + MTP draft head, before the router push |
