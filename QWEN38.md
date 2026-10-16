@@ -10,7 +10,7 @@ variables the engine behaves as upstream.
 
 ## Hardware and setup
 - RTX 5070 Ti 16 GB (the model only, no monitor) + RTX 4060 Ti 8 GB (monitors and the vision encoder), Windows 11.
-- Ryzen 9 7950X, 128 GB DDR5 (4 x 32 GB at 3600-3800 MT/s, 42-44 GB/s measured read).
+- Ryzen 9 7950X, 128 GB DDR5 (4 x 32 GB at 3800 MT/s, 42-44 GB/s measured read).
 - ~7,000 of the 24,576 experts fit in VRAM (29%); with the router push (`STRATA_ROUTE_PRIOR=1.0`) ~98% of the decode picks hit VRAM.
 
 ## Settings that matter (no code: upstream options and tools, measured here)
@@ -26,9 +26,9 @@ variables the engine behaves as upstream.
 ## What helped (in daily use)
 | change | branch | variable | measured |
 |---|---|---|---|
-| **per-client expert memory**: when a program comes back after another one filled the cache, its expert counts are restored and one big adaptation runs | `apatassini/client-memory` | `STRATA_CLIENT_MEMORY=2048` | agent step right after another program **+21%** tok/s; cache already adapted +11% |
-| **short prompt reads**: the decode router push also in short prefill chunks, and resident experts used by few rows computed straight from the compressed blob with the decode grouped kernel instead of one MMQ conversion launch per expert | `apatassini/short-prompt-reads` | `STRATA_PF_ROUTE_PRIOR=1.0` (`STRATA_PF_DIRETTO`, `STRATA_PF_DIRETTO_MAX`) | 177 tokens 473 → 315 ms, ~500 668 → 470 ms, ~900 826 → 677 ms; in real agent traffic 300-1000-token reads **-37/-41%**. The read push changes outputs a little like the decode push; so far only sanity-checked, no separate quality run yet |
-| **faster start**: arena copy with 14 threads, vision encoder started in parallel when it lives on another GPU | `apatassini/arena-load-threads`, `apatassini/vision-parallel-start` | `STRATA_ARENA_THREADS` | cold start 21 → 14 s; "restart" 34 → 16 s (with a shorter wait in my start script) |
+| **per-client expert memory**: when a program comes back after another one filled the cache, its expert counts are restored and one big adaptation runs | [`client-memory`](https://github.com/apatassini/Strata/tree/client-memory) | `STRATA_CLIENT_MEMORY=2048` | agent step right after another program **+21%** tok/s; cache already adapted +11% |
+| **short prompt reads**: the decode router push also in short prefill chunks, and resident experts used by few rows computed straight from the compressed blob with the decode grouped kernel instead of one MMQ conversion launch per expert | [`short-prompt-reads`](https://github.com/apatassini/Strata/tree/short-prompt-reads) | `STRATA_PF_ROUTE_PRIOR=1.0` (`STRATA_PF_DIRETTO`, `STRATA_PF_DIRETTO_MAX`) | 177 tokens 473 → 315 ms, ~500 668 → 470 ms, ~900 826 → 677 ms; in real agent traffic 300-1000-token reads **-37/-41%**. The read push changes outputs a little like the decode push; so far only sanity-checked, no separate quality run yet |
+| **faster start**: arena copy with 14 threads, vision encoder started in parallel when it lives on another GPU | [`arena-load-threads`](https://github.com/apatassini/Strata/tree/arena-load-threads), [`vision-parallel-start`](https://github.com/apatassini/Strata/tree/vision-parallel-start) | `STRATA_ARENA_THREADS` | cold start 21 → 14 s; "restart" 34 → 16 s (with a shorter wait in my start script) |
 | **own MTP draft head** trained on my long agent conversations (16K-token context, the model's own probabilities) | method below | — | +4-5% on the same work vs the Basalt head |
 
 Why short reads matter: in a real 5-hour agent session (526 model calls) **74% of the prompt reads were under 1,000 tokens and
@@ -52,11 +52,12 @@ difference was the **context**: the engine gives the head the last 16,384 tokens
 Recipe: record the head's inputs in the engine (a recorder patch), train on whole requests and whole conversations
 (long-context attention in chunks to fit 16 GB), one pass (a second one memorises), with the model's own probabilities as
 soft targets. I also use a draft vocabulary that includes Italian words; **anyone can do the same with the language and the
-vocabulary of their own work**. The recorder patch is in the `qwen38` branch (`STRATA_MTP_DUMP`).
+vocabulary of their own work**. The recorder patch is in the `qwen38-vetrina` branch (`STRATA_MTP_DUMP`).
 
 ## Branches
-- `apatassini/*`: one improvement each, on top of upstream `296b59d` (0.1.44.1), meant as pull requests.
-- `qwen38`: everything I run, on top of 0.1.43 (`7695859`), including the opt-in experiments above and the recorders
+- `short-prompt-reads`, `client-memory`, `arena-load-threads`, `vision-parallel-start`: one improvement each, on top of
+  upstream `296b59d` (0.1.44.1), meant as pull requests.
+- `qwen38-vetrina` (this page): everything I run, on top of 0.1.43 (`7695859`), including the opt-in experiments above and the recorders
   (`STRATA_MTP_DUMP`, `STRATA_ROUTE_DUMP`).
 
 License: MIT, as upstream.
