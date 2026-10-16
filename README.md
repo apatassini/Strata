@@ -16,6 +16,7 @@ RTX 5070 Ti 16 GB (the model only) + RTX 4060 Ti 8 GB (monitors and the vision e
 |---|---|---|
 | **writes code, short chat** | **178 tok/s** (152 with the official engine 0.1.41 and default settings) | 12/10/2026, 0.1.43 + MTP draft head, before the router push |
 | **agent steps** (24 real steps of my coding agent, 50-190K tokens of context, temperature 0.6) | **164.8 tok/s** (130.1 the same morning before the router push and the Q3_K kernel: **+27%**) | 14/10/2026 |
+| **real daily use** (every answer of 300+ tokens from the programs that use it, test hours excluded) | median **174 tok/s**, 1 in 4 above **190**, 1 in 10 above **203**, fastest **234** (238 answers); it depends a lot on what it writes: code and file rewrites are the fastest | 16/10/2026 from 13:29, all the changes on, from my per-request log |
 | **a real agent job** in the agent's window (same task, with and without the router push) | **159.8 vs 133.7 tok/s** (+19.5%) | 14/10/2026 |
 | **reads a long prompt** | **203K tokens in 58.5 s** (~3,470 tok/s) | 0.1.43 |
 | **reads short prompts** (what an agent reads most) | 177 tokens 315 ms (was 473), ~500 470 ms (was 668), ~900 677 ms (was 826); in real agent traffic -37/-41% | 16/10/2026 |
